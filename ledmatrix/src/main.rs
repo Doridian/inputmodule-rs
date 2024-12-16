@@ -3,7 +3,7 @@
 #![no_main]
 #![allow(clippy::needless_range_loop)]
 
-use cortex_m::delay::Delay;
+//use cortex_m::delay::Delay;
 //use defmt::*;
 use defmt_rtt as _;
 use embedded_hal::digital::v2::{InputPin, OutputPin};
@@ -16,25 +16,8 @@ use rp2040_hal::{
 //use panic_probe as _;
 use rp2040_panic_usb_boot as _;
 
-#[derive(PartialEq, Eq)]
-#[allow(dead_code)]
-enum SleepMode {
-    /// Instantly go to sleep ant
-    Instant,
-    /// Fade brightness out and in slowly when sleeping/waking-up
-    Fading,
-    // Display "SLEEP" when sleeping, instead of turning LEDs off
-    Debug,
-}
-
-/// Static configuration whether sleep shohld instantly turn all LEDs on/off or
-/// slowly fade themm on/off
-const SLEEP_MODE: SleepMode = SleepMode::Fading;
-
-const STARTUP_ANIMATION: bool = true;
-
 /// Go to sleep after 60s awake
-const SLEEP_TIMEOUT: u64 = 60_000_000;
+const SLEEP_TIMEOUT: u64 = 10_000_000;
 
 /// List maximum current as 500mA in the USB descriptor
 const MAX_CURRENT: usize = 500;
@@ -109,11 +92,8 @@ const MAX_BRIGHTNESS: u8 = 50;
 // Provide an alias for our BSP so we can switch targets quickly.
 // Uncomment the BSP you included in Cargo.toml, the rest of the code does not need to change.
 use bsp::entry;
-use fl16_inputmodules::animations::*;
 #[cfg(feature = "evt")]
 use fl16_inputmodules::fl16::EVT_CALC_PIXEL;
-use fl16_inputmodules::games::pong_animation::*;
-use fl16_inputmodules::games::snake_animation::*;
 use fl16_inputmodules::{games::game_of_life, led_hal as bsp};
 use is31fl3741::devices::LedMatrix;
 #[cfg(not(feature = "evt"))]
@@ -243,25 +223,7 @@ fn main() -> ! {
         upcoming_frames: None,
     };
     state.debug_mode = dip1.is_low().unwrap();
-    if show_startup_animation(&state) {
-        state.upcoming_frames = Some(match get_random_byte(&rosc) % 8 {
-            0 => Animation::Percentage(StartupPercentageIterator::default()),
-            1 => Animation::ZigZag(ZigZagIterator::default()),
-            2 => Animation::Gof(GameOfLifeIterator::new(GameOfLifeStartParam::Pattern1, 200)),
-            3 => Animation::Gof(GameOfLifeIterator::new(
-                GameOfLifeStartParam::BeaconToadBlinker,
-                128,
-            )),
-            4 => Animation::Gof(GameOfLifeIterator::new(GameOfLifeStartParam::Glider, 128)),
-            5 => Animation::Breathing(BreathingIterator::default()),
-            6 => Animation::Pong(PongIterator::default()),
-            7 => Animation::Snake(SnakeIterator::default()),
-            _ => unreachable!(),
-        });
-    } else {
-        // If no startup animation, keep display always on
-        state.grid = percentage(100);
-    };
+    state.grid = percentage(0);
 
     #[cfg(feature = "evt")]
     let mut matrix = LedMatrix::new(i2c, EVT_CALC_PIXEL);
@@ -379,7 +341,6 @@ fn main() -> ! {
             sleep_reason,
             &mut state,
             &mut matrix,
-            &mut delay,
             &mut led_enable,
         );
 
@@ -424,7 +385,7 @@ fn main() -> ! {
                     panic!("Never occurs here. Only if poll() returns false")
                 }
             }
-            let mut buf = [0u8; 64];
+            let mut buf = [0u8; 512];
             match serial.read(&mut buf) {
                 Err(_e) => {
                     // Do nothing
@@ -467,7 +428,6 @@ fn main() -> ! {
                                 sleep_reason,
                                 &mut state,
                                 &mut matrix,
-                                &mut delay,
                                 &mut led_enable,
                             );
 
@@ -568,23 +528,6 @@ fn get_random_byte(rosc: &RingOscillator<Enabled>) -> u8 {
     byte
 }
 
-fn dyn_sleep_mode(state: &LedmatrixState) -> SleepMode {
-    if state.debug_mode {
-        SleepMode::Debug
-    } else {
-        SLEEP_MODE
-    }
-}
-
-fn debug_mode(state: &LedmatrixState) -> bool {
-    dyn_sleep_mode(state) == SleepMode::Debug
-}
-
-fn show_startup_animation(state: &LedmatrixState) -> bool {
-    // Show startup animation
-    STARTUP_ANIMATION && !debug_mode(state)
-}
-
 fn assign_sleep_reason(
     previous: Option<SleepReason>,
     current: Option<SleepReason>,
@@ -607,74 +550,29 @@ fn handle_sleep(
     sleep_reason: Option<SleepReason>,
     state: &mut LedmatrixState,
     matrix: &mut Foo,
-    delay: &mut Delay,
     led_enable: &mut gpio::Pin<Gpio29, gpio::Output<gpio::PushPull>>,
 ) {
     match (state.sleeping.clone(), sleep_reason) {
         // Awake and staying awake
         (SleepState::Awake, None) => (),
-        (SleepState::Awake, Some(sleep_reason)) => {
+        (SleepState::Awake, Some(_sleep_reason)) => {
             state.sleeping = SleepState::Sleeping((state.grid.clone(), state.brightness));
-            // Slowly decrease brightness
-            if dyn_sleep_mode(state) == SleepMode::Fading {
-                let mut brightness = state.brightness;
-                loop {
-                    delay.delay_ms(100);
-                    brightness = if brightness <= 5 { 0 } else { brightness - 5 };
-                    set_brightness(state, brightness, matrix);
-                    if brightness == 0 {
-                        break;
-                    }
-                }
-            }
-
-            if debug_mode(state) {
-                state.grid = display_sleep_reason(sleep_reason);
-                fill_grid_pixels(state, matrix);
-            } else {
-                // Turn LED controller off to save power
-                led_enable.set_low().unwrap();
-            }
+            // Turn LED controller off to save power
+            led_enable.set_low().unwrap();
 
             // TODO: Set up SLEEP# pin as interrupt and wfi
             //cortex_m::asm::wfi();
         }
         // Already sleeping and new sleep reason => just keep sleeping
-        (SleepState::Sleeping(_), Some(sleep_reason)) => {
-            // If debug mode is enabled, then make sure the latest sleep reason is displayed
-            if debug_mode(state) {
-                state.grid = display_sleep_reason(sleep_reason);
-                fill_grid_pixels(state, matrix);
-            }
-        }
+        (SleepState::Sleeping(_), Some(_sleep_reason)) => (),
         // Sleeping and need to wake up
-        (SleepState::Sleeping((old_grid, old_brightness)), None) => {
+        (SleepState::Sleeping(_), None) => {
             // Restore back grid before sleeping
             state.sleeping = SleepState::Awake;
-            state.grid = old_grid;
+            // state.grid = old_grid;
+            state.grid = percentage(0);
             fill_grid_pixels(state, matrix);
-
-            // Power LED controller back on
-            if !debug_mode(state) {
-                led_enable.set_high().unwrap();
-            }
-
-            // Slowly increase brightness
-            if dyn_sleep_mode(state) == SleepMode::Fading {
-                let mut brightness = 0;
-                loop {
-                    delay.delay_ms(100);
-                    brightness = if brightness >= old_brightness - 5 {
-                        old_brightness
-                    } else {
-                        brightness + 5
-                    };
-                    set_brightness(state, brightness, matrix);
-                    if brightness == old_brightness {
-                        break;
-                    }
-                }
-            }
+            led_enable.set_high().unwrap();
         }
     }
 }
